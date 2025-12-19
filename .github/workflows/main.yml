@@ -1,4 +1,4 @@
-name: RDP
+name: RDP Node.js
 
 on:
   workflow_dispatch:
@@ -9,6 +9,14 @@ jobs:
     timeout-minutes: 360
 
     steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
       - name: Configure Core RDP Settings
         run: |
           # Enable Remote Desktop and disable Network Level Authentication
@@ -19,7 +27,7 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
                              -Name "SecurityLayer" -Value 0 -Force
 
-          # Remove any existing rule with the same name to avoid duplication
+          # Remove any existing rule with the same name
           netsh advfirewall firewall delete rule name="RDP-Access" 2>$null
           
           # Allow incoming connection on port 3389
@@ -32,9 +40,9 @@ jobs:
       - name: Create RDP User with Secure Password
         run: |
           $charSet = @{
-              Upper   = [char[]](65..90)      # A-Z
-              Lower   = [char[]](97..122)     # a-z
-              Number  = [char[]](48..57)      # 0-9
+              Upper   = [char[]](65..90)
+              Lower   = [char[]](97..122)
+              Number  = [char[]](48..57)
               Special = @('!','@','#','$','%','^','&','*')
           }
           $rawPassword = @()
@@ -52,142 +60,214 @@ jobs:
           echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
           Write-Host "User RDP created successfully"
 
-      - name: Install Tailscale
+      - name: Create Node.js RDP Manager Script
         run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
-          
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -UseBasicParsing
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Start-Sleep -Seconds 10
-          Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
+          $scriptContent = @'
+          const { exec } = require('child_process');
+          const http = require('http');
+          const util = require('util');
+          const execPromise = util.promisify(exec);
 
-      - name: Establish Tailscale Connection
-        run: |
-          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID --accept-routes
-          
-          # Wait for Tailscale to assign an IP
-          $tsIP = $null
-          $retries = 0
-          while (-not $tsIP -and $retries -lt 20) {
-              Start-Sleep -Seconds 3
-              $tsIP = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
-              $retries++
-          }
-          
-          if (-not $tsIP) {
-              Write-Warning "Tailscale IP not assigned after 60 seconds"
-              echo "TAILSCALE_IP=Not Available" >> $env:GITHUB_ENV
-          } else {
-              $tsIP = $tsIP.Trim()
-              echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-              Write-Host "Tailscale IP: $tsIP"
-          }
+          class RDPManager {
+            constructor() {
+              this.tailscaleIP = null;
+              this.ngrokURL = null;
+              this.password = process.env.RDP_PASSWORD;
+            }
 
-      - name: Install and Configure ngrok
-        run: |
-          # Download ngrok
-          $ngrokUrl = "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip"
-          $ngrokZip = "$env:TEMP\ngrok.zip"
-          $ngrokDir = "$env:TEMP\ngrok"
-          
-          Invoke-WebRequest -Uri $ngrokUrl -OutFile $ngrokZip -UseBasicParsing
-          Expand-Archive -Path $ngrokZip -DestinationPath $ngrokDir -Force
-          Remove-Item $ngrokZip -Force
-          
-          # Configure ngrok with auth token
-          & "$ngrokDir\ngrok.exe" config add-authtoken ${{ secrets.NGROK_AUTH_TOKEN }}
-          
-          # Start ngrok tunnel for RDP (port 3389)
-          Start-Process -FilePath "$ngrokDir\ngrok.exe" -ArgumentList "tcp 3389 --log=stdout" -WindowStyle Hidden
-          
-          Write-Host "Waiting for ngrok tunnel to establish..."
-          Start-Sleep -Seconds 10
-          
-          # Get ngrok public URL
-          try {
-              $ngrokApi = Invoke-RestMethod -Uri "http://localhost:4040/api/tunnels" -UseBasicParsing
-              $publicUrl = $ngrokApi.tunnels[0].public_url
-              
-              if ($publicUrl) {
-                  # Extract host and port from tcp://x.x.x.x:port format
-                  $publicUrl = $publicUrl -replace "tcp://", ""
-                  echo "NGROK_URL=$publicUrl" >> $env:GITHUB_ENV
-                  Write-Host "ngrok tunnel established: $publicUrl"
-              } else {
-                  Write-Warning "ngrok tunnel URL not found"
-                  echo "NGROK_URL=Not Available" >> $env:GITHUB_ENV
+            async setupTailscale() {
+              console.log('🔄 Installing Tailscale...');
+              try {
+                const tsUrl = 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi';
+                const installerPath = `${process.env.TEMP}\\tailscale.msi`;
+                
+                await execPromise(`powershell -Command "Invoke-WebRequest -Uri '${tsUrl}' -OutFile '${installerPath}' -UseBasicParsing"`);
+                await execPromise(`msiexec /i "${installerPath}" /quiet /norestart`);
+                
+                console.log('⏳ Waiting for Tailscale installation...');
+                await this.sleep(10000);
+                
+                const authKey = process.env.TAILSCALE_AUTH_KEY;
+                const hostname = `gh-runner-${process.env.GITHUB_RUN_ID}`;
+                
+                await execPromise(`"C:\\Program Files\\Tailscale\\tailscale.exe" up --authkey=${authKey} --hostname=${hostname} --accept-routes`);
+                
+                for (let i = 0; i < 20; i++) {
+                  try {
+                    const { stdout } = await execPromise(`"C:\\Program Files\\Tailscale\\tailscale.exe" ip -4`);
+                    if (stdout.trim()) {
+                      this.tailscaleIP = stdout.trim();
+                      console.log(`✅ Tailscale connected: ${this.tailscaleIP}`);
+                      return true;
+                    }
+                  } catch (err) {
+                    // Continue trying
+                  }
+                  await this.sleep(3000);
+                }
+                
+                console.warn('⚠️  Tailscale IP not assigned');
+                return false;
+              } catch (error) {
+                console.error('❌ Tailscale setup failed:', error.message);
+                return false;
               }
-          } catch {
-              Write-Warning "Could not retrieve ngrok tunnel info: $_"
-              echo "NGROK_URL=Not Available" >> $env:GITHUB_ENV
-          }
-      
-      - name: Verify RDP Accessibility
-        run: |
-          if ($env:TAILSCALE_IP -ne "Not Available") {
-              Write-Host "Testing RDP on Tailscale IP: $env:TAILSCALE_IP"
-              $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
-              if ($testResult.TcpTestSucceeded) {
-                  Write-Host "✓ RDP accessible via Tailscale"
-              } else {
-                  Write-Warning "✗ RDP not accessible via Tailscale"
+            }
+
+            async setupNgrok() {
+              console.log('🔄 Installing ngrok...');
+              try {
+                const ngrokUrl = 'https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip';
+                const ngrokZip = `${process.env.TEMP}\\ngrok.zip`;
+                const ngrokDir = `${process.env.TEMP}\\ngrok`;
+                
+                await execPromise(`powershell -Command "Invoke-WebRequest -Uri '${ngrokUrl}' -OutFile '${ngrokZip}' -UseBasicParsing"`);
+                await execPromise(`powershell -Command "Expand-Archive -Path '${ngrokZip}' -DestinationPath '${ngrokDir}' -Force"`);
+                
+                const authToken = process.env.NGROK_AUTH_TOKEN;
+                await execPromise(`"${ngrokDir}\\ngrok.exe" config add-authtoken ${authToken}`);
+                
+                // Start ngrok in background
+                exec(`"${ngrokDir}\\ngrok.exe" tcp 3389 --log=stdout`);
+                
+                console.log('⏳ Waiting for ngrok tunnel...');
+                await this.sleep(10000);
+                
+                // Get tunnel info from ngrok API
+                const tunnelInfo = await this.getNgrokTunnel();
+                if (tunnelInfo) {
+                  this.ngrokURL = tunnelInfo;
+                  console.log(`✅ ngrok tunnel established: ${this.ngrokURL}`);
+                  return true;
+                }
+                
+                console.warn('⚠️  ngrok URL not available');
+                return false;
+              } catch (error) {
+                console.error('❌ ngrok setup failed:', error.message);
+                return false;
               }
-          }
-          
-          # Test local RDP
-          $localTest = Test-NetConnection -ComputerName "127.0.0.1" -Port 3389 -WarningAction SilentlyContinue
-          if ($localTest.TcpTestSucceeded) {
-              Write-Host "✓ RDP service is running locally"
-          } else {
-              Write-Error "✗ RDP service is not running"
-              exit 1
+            }
+
+            async getNgrokTunnel() {
+              return new Promise((resolve) => {
+                http.get('http://localhost:4040/api/tunnels', (res) => {
+                  let data = '';
+                  res.on('data', chunk => data += chunk);
+                  res.on('end', () => {
+                    try {
+                      const json = JSON.parse(data);
+                      if (json.tunnels && json.tunnels[0]) {
+                        const publicUrl = json.tunnels[0].public_url.replace('tcp://', '');
+                        resolve(publicUrl);
+                      } else {
+                        resolve(null);
+                      }
+                    } catch (err) {
+                      resolve(null);
+                    }
+                  });
+                }).on('error', () => resolve(null));
+              });
+            }
+
+            async verifyRDP() {
+              console.log('🔍 Verifying RDP service...');
+              try {
+                const { stdout } = await execPromise('powershell -Command "Test-NetConnection -ComputerName 127.0.0.1 -Port 3389 -WarningAction SilentlyContinue | Select-Object -ExpandProperty TcpTestSucceeded"');
+                
+                if (stdout.trim() === 'True') {
+                  console.log('✅ RDP service is running');
+                  return true;
+                } else {
+                  console.error('❌ RDP service is not accessible');
+                  return false;
+                }
+              } catch (error) {
+                console.error('❌ RDP verification failed:', error.message);
+                return false;
+              }
+            }
+
+            displayConnectionInfo() {
+              console.log('\n==========================================');
+              console.log('       RDP CONNECTION DETAILS');
+              console.log('==========================================\n');
+              console.log('Username: RDP');
+              console.log(`Password: ${this.password}\n`);
+              console.log('------------------------------------------');
+              console.log('Connection Methods:');
+              console.log('------------------------------------------');
+              
+              if (this.tailscaleIP) {
+                console.log('\n1. TAILSCALE (Private Network)');
+                console.log(`   Address: ${this.tailscaleIP}`);
+                console.log('   Note: Requires Tailscale client');
+              }
+              
+              if (this.ngrokURL) {
+                console.log('\n2. NGROK (Public Access)');
+                console.log(`   Address: ${this.ngrokURL}`);
+                console.log('   Note: Accessible from anywhere');
+              }
+              
+              console.log('\n===========================================\n');
+            }
+
+            async maintainConnection() {
+              let iteration = 0;
+              while (true) {
+                iteration++;
+                const timestamp = new Date().toISOString().replace('T', ' ').substring(0, 19);
+                console.log(`[${timestamp}] RDP session active (iteration: ${iteration})`);
+                
+                // Check RDP service status
+                try {
+                  const { stdout } = await execPromise('powershell -Command "(Get-Service -Name TermService).Status"');
+                  if (!stdout.includes('Running')) {
+                    console.warn('⚠️  RDP service stopped, restarting...');
+                    await execPromise('powershell -Command "Restart-Service -Name TermService -Force"');
+                  }
+                } catch (err) {
+                  console.error('❌ Error checking RDP service:', err.message);
+                }
+                
+                await this.sleep(300000); // 5 minutes
+              }
+            }
+
+            sleep(ms) {
+              return new Promise(resolve => setTimeout(resolve, ms));
+            }
+
+            async run() {
+              console.log('🚀 Starting RDP Manager...\n');
+              
+              await this.setupTailscale();
+              await this.setupNgrok();
+              
+              const rdpOk = await this.verifyRDP();
+              if (!rdpOk) {
+                process.exit(1);
+              }
+              
+              this.displayConnectionInfo();
+              await this.maintainConnection();
+            }
           }
 
-      - name: Display Connection Information
-        run: |
-          Write-Host "`n=========================================="
-          Write-Host "       RDP CONNECTION DETAILS"
-          Write-Host "=========================================="
-          Write-Host ""
-          Write-Host "Username: RDP"
-          Write-Host "Password: $env:RDP_PASSWORD"
-          Write-Host ""
-          Write-Host "------------------------------------------"
-          Write-Host "Connection Methods:"
-          Write-Host "------------------------------------------"
+          const manager = new RDPManager();
+          manager.run().catch(err => {
+            console.error('❌ Fatal error:', err);
+            process.exit(1);
+          });
+          '@
           
-          if ($env:TAILSCALE_IP -ne "Not Available") {
-              Write-Host ""
-              Write-Host "1. TAILSCALE (Private Network)"
-              Write-Host "   Address: $env:TAILSCALE_IP"
-              Write-Host "   Note: Requires Tailscale client"
-          }
-          
-          if ($env:NGROK_URL -ne "Not Available") {
-              Write-Host ""
-              Write-Host "2. NGROK (Public Access)"
-              Write-Host "   Address: $env:NGROK_URL"
-              Write-Host "   Note: Accessible from anywhere"
-          }
-          
-          Write-Host ""
-          Write-Host "==========================================="
-          Write-Host ""
+          $scriptContent | Out-File -FilePath "rdp-manager.js" -Encoding UTF8
+          Write-Host "Node.js script created successfully"
 
-      - name: Maintain Connection
-        run: |
-          $iteration = 0
-          while ($true) {
-              $iteration++
-              Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] RDP session active (iteration: $iteration)"
-              
-              # Check if RDP service is still running
-              $rdpService = Get-Service -Name TermService
-              if ($rdpService.Status -ne 'Running') {
-                  Write-Warning "RDP service stopped, restarting..."
-                  Restart-Service -Name TermService -Force
-              }
-              
-              Start-Sleep -Seconds 300
-          }
+      - name: Run RDP Manager
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          NGROK_AUTH_TOKEN: 2GojiLp7YGmUIQiPq15okMLSOLU_48VG8MKEE1EEvG7Zzj8CF
+        run: node rdp-manager.js
